@@ -88,7 +88,7 @@ const TIMING = {
   PREPARE_WAIT: 3000, PREPARE_MAX: 3,
   AFTER_PREPARE: 2000, RESET_SETTLE: 1500,
   HS_FIRST: 5000, HS_RETRY: 2000, HS_MAX: 8,
-  FIRST3: 1000, DATA_RESP: 2500, DATA_MAX_RESEND: 8, DATA_PASSES: 5,
+  FIRST3: 1000, DATA_RESP: 2500, DATA_MAX_RESEND: 8, DATA_PASSES: 8,
   BEFORE_FINISH: 3300, FINISH: 10000,
   RECONNECT_TRY: 12, RECONNECT_GAP: 700
 };
@@ -591,25 +591,25 @@ if(typeof document!=='undefined'){
       _attach: attachNotify,
       isConnected(){ return !!(dev && dev.gatt && dev.gatt.connected && gattChar); },
       async send(frame, fast){
-        // Scrittura a pezzi da 20 byte.
-        // - Frame di controllo (identità, bootloader, prepara, handshake): scrittura
-        //   "con risposta", lenta ma sicurissima. Sono pochi e rari.
-        //   (Senza controllo di flusso il modulo BLE perderebbe pezzi di un frame lungo.)
-        // - Frame dati (fast=true): scrittura "senza risposta" con una piccola pausa tra
-        //   i pezzi. È molto più veloce (il trasferimento dura ~2-3 min invece di ~13, così
-        //   il Bluetooth non si satura e non "muore" a metà), e l'integrità è garantita
-        //   comunque dall'ack per pacchetto: se un pezzo si perde, il pacchetto non viene
-        //   accettato e lo rimandiamo.
-        const canResp = gattChar.properties ? gattChar.properties.write : true;
-        const canNoResp = gattChar.properties ? gattChar.properties.writeWithoutResponse : true;
-        for(let i=0;i<frame.length;i+=WRITE_CHUNK){
-          const piece=frame.slice(i, i+WRITE_CHUNK);
-          if(fast && canNoResp && gattChar.writeValueWithoutResponse){
-            await gattChar.writeValueWithoutResponse(piece);
-            await new Promise(r=>setTimeout(r, 7));
-          } else if(canResp && gattChar.writeValueWithResponse){ await gattChar.writeValueWithResponse(piece); }
-          else if(canResp && gattChar.writeValue){ await gattChar.writeValue(piece); }
-          else { await gattChar.writeValueWithoutResponse(piece); await new Promise(r=>setTimeout(r,10)); }
+        // Scrittura SEMPRE "con conferma" (su questo caricatore la modalità senza
+        // conferma non viene ricevuta). Per velocizzare, scrivo pezzi il più grandi
+        // possibile: provo grande e, se il modulo BLE non li accetta (MTU piccolo),
+        // dimezzo fino a 20 byte. La dimensione che funziona viene ricordata, così
+        // il trasferimento scorre veloce quando il telefono negozia un MTU ampio.
+        const writeOne = (buf)=>{
+          if(gattChar.writeValueWithResponse) return gattChar.writeValueWithResponse(buf);
+          if(gattChar.writeValue) return gattChar.writeValue(buf);
+          return gattChar.writeValueWithoutResponse(buf);
+        };
+        let size = this._wsize || 244;
+        for(;;){
+          try{
+            for(let i=0;i<frame.length;i+=size){ await writeOne(frame.slice(i, i+size)); }
+            this._wsize = size; return;
+          }catch(e){
+            if(size>WRITE_CHUNK){ size=Math.max(WRITE_CHUNK, size>>1); continue; }
+            throw e;
+          }
         }
       },
       async reconnect(){
@@ -650,6 +650,7 @@ if(typeof document!=='undefined'){
                '<div class="kv"><span>Versione installata</span><b>'+id.major+'.'+id.minor+' · hw '+id.hw+'</b></div>'+
                '<div class="kv"><span>Pacchetti dati</span><b>'+dlen+' byte</b></div>';
       $('devInfo').innerHTML=info;
+      if(realTransport._wsize){ log('Scrittura BLE calibrata a '+realTransport._wsize+' byte per pezzo'+(realTransport._wsize>=200?' (veloce ✓)':' (MTU piccolo, sarà più lento)')+'.'); }
       if(dlen!==196){ log('⚠️ Bootloader a 16 byte: fermati e avvisami, non proseguo.'); }
       refresh();
     }catch(e){ log('Errore connessione: '+e.message); }

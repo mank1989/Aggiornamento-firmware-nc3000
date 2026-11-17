@@ -552,11 +552,17 @@ if(typeof document!=='undefined'){
       _attach: attachNotify,
       isConnected(){ return !!(dev && dev.gatt && dev.gatt.connected && gattChar); },
       async send(frame){
-        // scrittura a pezzi da 20 byte, senza risposta
+        // Scrittura a pezzi da 20 byte. I frame lunghi (handshake 202 B, dati 204 B)
+        // sono ~11 pezzi: senza controllo di flusso il modulo BLE ne perde e il frame
+        // arriva incompleto. Quindi, se la caratteristica supporta la scrittura "con
+        // risposta", la usiamo (ogni pezzo è confermato prima del successivo); altrimenti
+        // mettiamo una piccola pausa tra un pezzo e l'altro.
+        const canResp = gattChar.properties ? gattChar.properties.write : true;
         for(let i=0;i<frame.length;i+=WRITE_CHUNK){
           const piece=frame.slice(i, i+WRITE_CHUNK);
-          if(gattChar.writeValueWithoutResponse) await gattChar.writeValueWithoutResponse(piece);
-          else await gattChar.writeValue(piece);
+          if(canResp && gattChar.writeValueWithResponse){ await gattChar.writeValueWithResponse(piece); }
+          else if(canResp && gattChar.writeValue){ await gattChar.writeValue(piece); }
+          else { await gattChar.writeValueWithoutResponse(piece); await new Promise(r=>setTimeout(r,12)); }
         }
       },
       async reconnect(){

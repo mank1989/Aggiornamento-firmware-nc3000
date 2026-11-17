@@ -182,7 +182,7 @@ class Flasher{
   // invia un frame e aspetta la risposta che soddisfa pred.
   // Ritorna il frame, oppure null su timeout o se l'invio fallisce (es. bus caduto):
   // nessun promise orfano, nessuna eccezione non gestita.
-  async sendWait(frame, pred, timeoutMs){
+  async sendWait(frame, pred, timeoutMs, fast){
     let waiter;
     const p=new Promise((resolve)=>{
       // controlla eventuali frame già arrivati
@@ -196,7 +196,7 @@ class Flasher{
       }, this.T(timeoutMs));
       this._waiters.push(waiter);
     });
-    try{ await this.send(frame); }
+    try{ await this.send(frame, fast); }
     catch(e){
       if(waiter){ clearTimeout(waiter.timer); const k=this._waiters.indexOf(waiter); if(k>=0) this._waiters.splice(k,1); }
       this.log('Invio fallito: '+e.message);
@@ -204,7 +204,7 @@ class Flasher{
     }
     return p;
   }
-  async send(frame){ this.log('TX '+hex(frame)); await this.t.send(frame); }
+  async send(frame, fast){ this.log('TX '+hex(frame)); await this.t.send(frame, fast); }
   _abortCheck(){ if(this.aborted) throw new Error('ABORT'); }
 
   // --- identità (solo in modalità applicazione) ---
@@ -285,6 +285,7 @@ class Flasher{
   async sendData(file){
     const total=Math.ceil(file.length/DATA_LEN);
     this.log('Invio '+total+' pacchetti da '+DATA_LEN+' byte.');
+    this._frames=[];                     // scarta eventuali risposte dell'handshake
     let num=1;
     while(num<=total){
       this._abortCheck();
@@ -295,10 +296,14 @@ class Flasher{
       for(let i=0;i<DATA_LEN && start+i<file.length;i++) payload[4+i]=file[start+i];
       let acked=false;
       for(let resend=0; resend<TIMING.DATA_MAX_RESEND && !acked; resend++){
-        const r=await this.sendWait(buildFrame(0x61, payload), f=>f[2]===0x61, TIMING.DATA_RESP);
+        this._frames=[];                 // il caricatore manda 3 ack uguali: scarto i duplicati vecchi
+        // aspetto un ack il cui CONTATORE sia ≥ al pacchetto appena inviato:
+        // così ignoro gli ack duplicati dei pacchetti precedenti.
+        const r=await this.sendWait(buildFrame(0x61, payload),
+                                    f=>f[2]===0x61 && (((f[4]<<8)|f[5])>=num),
+                                    TIMING.DATA_RESP, true);
         if(!r){ this.log('Pacchetto '+num+': nessuna risposta, rimando ('+(resend+1)+')'); continue; }
         const cnt=(r[4]<<8)|r[5];
-        if(cnt < num-1) this.log('Pacchetto '+num+': il caricatore è a '+cnt+', riparto da '+(cnt+1));
         num=cnt+1; acked=true;             // contatore autorevole → prossimo = cnt+1
         this.onProgress(Math.min(num-1,total), total);
       }
@@ -437,7 +442,9 @@ class FakeCharger{
       }
       // il byte "stato" può essere 0 (come un duplicato): il client deve fidarsi del contatore
       const statusByte = (this.dupStatusAt && num===this.dupStatusAt) ? 0x00 : 0x01;
-      this._emit(buildFrame(0x61,[statusByte,(repCount>>8)&0xff, repCount&0xff]));
+      const ack=buildFrame(0x61,[statusByte,(repCount>>8)&0xff, repCount&0xff]);
+      // come il caricatore vero: manda l'ack 3 volte (il client deve ignorare i duplicati)
+      this._emit(ack); this._emit(ack); this._emit(ack);
     } else if(cmd===0x62){
       const p=frame.slice(3, frame.length-1);
       const got=(p[0])|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);
@@ -463,7 +470,7 @@ class FakeTransport{
   constructor(charger){ this.c=charger; this.connected=true; charger.attach((bytes)=>{ if(this._cb) this._cb(bytes); }); }
   onData(cb){ this._cb=cb; }
   isConnected(){ return this.connected && !this.c.busDown; }
-  async send(frame){ if(this.c.busDown){ throw new Error('bus down'); } await this.c.receive(toBytes(frame)); }
+  async send(frame, fast){ if(this.c.busDown){ throw new Error('bus down'); } await this.c.receive(toBytes(frame)); }
   async reconnect(force){ await this.c.reconnect(force); this.connected=true; }
 }
 
@@ -583,18 +590,26 @@ if(typeof document!=='undefined'){
       onData(fn){ cb=fn; },
       _attach: attachNotify,
       isConnected(){ return !!(dev && dev.gatt && dev.gatt.connected && gattChar); },
-      async send(frame){
-        // Scrittura a pezzi da 20 byte. I frame lunghi (handshake 202 B, dati 204 B)
-        // sono ~11 pezzi: senza controllo di flusso il modulo BLE ne perde e il frame
-        // arriva incompleto. Quindi, se la caratteristica supporta la scrittura "con
-        // risposta", la usiamo (ogni pezzo è confermato prima del successivo); altrimenti
-        // mettiamo una piccola pausa tra un pezzo e l'altro.
+      async send(frame, fast){
+        // Scrittura a pezzi da 20 byte.
+        // - Frame di controllo (identità, bootloader, prepara, handshake): scrittura
+        //   "con risposta", lenta ma sicurissima. Sono pochi e rari.
+        //   (Senza controllo di flusso il modulo BLE perderebbe pezzi di un frame lungo.)
+        // - Frame dati (fast=true): scrittura "senza risposta" con una piccola pausa tra
+        //   i pezzi. È molto più veloce (il trasferimento dura ~2-3 min invece di ~13, così
+        //   il Bluetooth non si satura e non "muore" a metà), e l'integrità è garantita
+        //   comunque dall'ack per pacchetto: se un pezzo si perde, il pacchetto non viene
+        //   accettato e lo rimandiamo.
         const canResp = gattChar.properties ? gattChar.properties.write : true;
+        const canNoResp = gattChar.properties ? gattChar.properties.writeWithoutResponse : true;
         for(let i=0;i<frame.length;i+=WRITE_CHUNK){
           const piece=frame.slice(i, i+WRITE_CHUNK);
-          if(canResp && gattChar.writeValueWithResponse){ await gattChar.writeValueWithResponse(piece); }
+          if(fast && canNoResp && gattChar.writeValueWithoutResponse){
+            await gattChar.writeValueWithoutResponse(piece);
+            await new Promise(r=>setTimeout(r, 7));
+          } else if(canResp && gattChar.writeValueWithResponse){ await gattChar.writeValueWithResponse(piece); }
           else if(canResp && gattChar.writeValue){ await gattChar.writeValue(piece); }
-          else { await gattChar.writeValueWithoutResponse(piece); await new Promise(r=>setTimeout(r,12)); }
+          else { await gattChar.writeValueWithoutResponse(piece); await new Promise(r=>setTimeout(r,10)); }
         }
       },
       async reconnect(){

@@ -88,7 +88,7 @@ const TIMING = {
   PREPARE_WAIT: 3000, PREPARE_MAX: 3,
   AFTER_PREPARE: 2000, RESET_SETTLE: 1500,
   HS_FIRST: 5000, HS_RETRY: 2000, HS_MAX: 8,
-  FIRST3: 1000, DATA_RESP: 2000, DATA_MAX_RESEND: 8,
+  FIRST3: 1000, DATA_RESP: 2500, DATA_MAX_RESEND: 8, DATA_PASSES: 5,
   BEFORE_FINISH: 3300, FINISH: 10000,
   RECONNECT_TRY: 12, RECONNECT_GAP: 700
 };
@@ -251,16 +251,19 @@ class Flasher{
     }
     await this.sleep(TIMING.AFTER_PREPARE);
   }
-  async _reconnect(){
+  async _reconnect(force){
     for(let i=1;i<=TIMING.RECONNECT_TRY;i++){
       this._abortCheck();
-      try{ await this.t.reconnect(); if(this.t.isConnected()){ this.log('Ricollegato (tentativo '+i+')'); this._rx=[]; return; } }
+      try{ await this.t.reconnect(force); if(this.t.isConnected()){ this.log('Ricollegato (tentativo '+i+')'); this._rx=[]; this._frames=[]; return; } }
       catch(e){ /* riprova */ }
       await this.sleep(TIMING.RECONNECT_GAP);
     }
     throw new Error('RECONNECT_FAIL');
   }
   // --- handshake 0x61 (200 zeri) ---
+  // Il bootloader risponde 0f 05 61 <A> <cntHi> <cntLo>. Il byte <A> cambia
+  // (01/00), quindi NON lo usiamo come stato: ci basiamo sul contatore.
+  // Contatore 0 = bootloader pronto, buffer azzerato, ricomincia dal pacchetto 1.
   async handshake(){
     const zeros=new Array(HS_ZEROS).fill(0);
     for(let att=1; att<=TIMING.HS_MAX; att++){
@@ -268,14 +271,17 @@ class Flasher{
       const to = att===1 ? TIMING.HS_FIRST : TIMING.HS_RETRY;
       const r=await this.sendWait(buildFrame(0x61, zeros), f=>f[2]===0x61, to);
       if(!r){ this.log('Handshake: nessuna risposta ('+att+')'); continue; }
-      const stato=r[3], cnt=(r[4]<<8)|r[5];
-      if(stato===0 && cnt===0){ this.log('Bootloader pronto a ricevere.'); return; }
-      this.log('Handshake: stato '+stato+' contatore '+cnt+', riprovo…');
+      const cnt=(r[4]<<8)|r[5];
+      if(cnt===0){ this.log('Bootloader pronto a ricevere.'); return; }
+      this.log('Handshake: contatore '+cnt+', riprovo…');
       await this.sleep(300);
     }
     throw new Error('HANDSHAKE_FAIL');
   }
   // --- invio dati 0x61 ---
+  // Il contatore nella risposta è autorevole: indica quanti pacchetti il
+  // bootloader ha accettato. Il prossimo da inviare è sempre cnt+1 (così gestiamo
+  // sia gli ack normali, sia i duplicati, sia una ripartenza indietro).
   async sendData(file){
     const total=Math.ceil(file.length/DATA_LEN);
     this.log('Invio '+total+' pacchetti da '+DATA_LEN+' byte.');
@@ -287,19 +293,16 @@ class Flasher{
       const payload=new Array(4+DATA_LEN).fill(0);
       payload[0]=(num>>8)&0xff; payload[1]=num&0xff;    // numero pacchetto BE
       for(let i=0;i<DATA_LEN && start+i<file.length;i++) payload[4+i]=file[start+i];
-      let done=false;
-      for(let resend=0; resend<TIMING.DATA_MAX_RESEND && !done; resend++){
+      let acked=false;
+      for(let resend=0; resend<TIMING.DATA_MAX_RESEND && !acked; resend++){
         const r=await this.sendWait(buildFrame(0x61, payload), f=>f[2]===0x61, TIMING.DATA_RESP);
         if(!r){ this.log('Pacchetto '+num+': nessuna risposta, rimando ('+(resend+1)+')'); continue; }
-        const stato=r[3], cnt=(r[4]<<8)|r[5];
-        if(stato===1){
-          if(cnt!==num){ this.log('Contatore '+cnt+' ≠ inviato '+num+': riparto da '+(cnt+1)); num=cnt+1; }
-          else num=num+1;
-          done=true;
-        } else { this.log('Pacchetto '+num+': stato '+stato+', rimando'); }
+        const cnt=(r[4]<<8)|r[5];
+        if(cnt < num-1) this.log('Pacchetto '+num+': il caricatore è a '+cnt+', riparto da '+(cnt+1));
+        num=cnt+1; acked=true;             // contatore autorevole → prossimo = cnt+1
+        this.onProgress(Math.min(num-1,total), total);
       }
-      if(!done) throw new Error('DATA_FAIL@'+num);
-      this.onProgress(Math.min(num-1,total), total);
+      if(!acked) throw new Error('DATA_STALL@'+num);
     }
   }
   // --- fine 0x62 (somma del file, 32 bit LE) ---
@@ -320,10 +323,27 @@ class Flasher{
       await this.afterPrepare();
     } else {
       this.log('Ripresa: salto il prepara (caricatore già nel bootloader).');
-      if(!this.t.isConnected()) await this._reconnect();
+      await this._reconnect(true);       // link pulito: azzera eventuali notifiche morte
     }
-    await this.handshake();
-    await this.sendData(file);
+    // Un handshake azzera il buffer del bootloader, quindi ogni giro riparte dal
+    // pacchetto 1. Se il trasferimento si blocca a metà (canale BLE morto), ci
+    // ricolleghiamo e ripartiamo da capo in automatico, fino a MAX_PASSES volte.
+    const MAX_PASSES = TIMING.DATA_PASSES;
+    let ok=false;
+    for(let pass=1; pass<=MAX_PASSES && !ok; pass++){
+      this._abortCheck();
+      await this.handshake();
+      try{ await this.sendData(file); ok=true; }
+      catch(e){
+        if(String(e.message).startsWith('DATA_STALL') && pass<MAX_PASSES){
+          this.log('⚠️ Trasferimento bloccato ('+e.message+'). Ricollego e riparto da capo (giro '+pass+'/'+MAX_PASSES+')…');
+          await this._reconnect(true);
+          continue;
+        }
+        throw new Error('DATA_FAIL:'+e.message);
+      }
+    }
+    if(!ok) throw new Error('DATA_FAIL:troppi blocchi');
     await this.finish(computeSum(file));
     return true;
   }
@@ -346,6 +366,9 @@ class FakeCharger{
     this.dropAfterPrepare=!!opts.dropAfterPrepare;
     this.loseResp=opts.loseResp||new Set();
     this.glitchCounterAt=opts.glitchCounterAt||0;
+    this.stallAt=opts.stallAt||0;              // va muto a questo pacchetto (una volta)
+    this._stalled=false;
+    this.dupStatusAt=opts.dupStatusAt||0;      // risponde con byte stato 0 (come un duplicato)
     this.slotActive=!!opts.slotActive;
     this.phase='app';                         // app -> boot
     this.received=new Map();                   // num -> 196 byte
@@ -365,7 +388,7 @@ class FakeCharger{
       Promise.resolve().then(()=>{ if(!this.busDown && this.cb) this.cb(piece); });
     }
   }
-  async reconnect(){ this.busDown=false; }
+  async reconnect(force){ this.busDown=false; }
   // riceve un frame intero dal Flasher
   async receive(frame){
     if(this.busDown) return;
@@ -391,11 +414,17 @@ class FakeCharger{
       const payload=frame.slice(3, frame.length-1);
       const isHandshake = payload.length>=200 && payload.every(b=>b===0);
       if(isHandshake){
-        this._emit(buildFrame(0x61,[0x00,0x00,0x00]));   // stato 0 contatore 0
+        // come il bootloader vero: l'handshake AZZERA il buffer → si riparte da 1
+        this.received=new Map(); this.count=0;
+        this._emit(buildFrame(0x61,[0x00,0x00,0x00]));   // contatore 0 = pronto
         return;
       }
       const num=(payload[0]<<8)|payload[1];
       const data=payload.slice(4, 4+DATA_LEN);
+      // blocco a metà (una volta): vado muto e "cade" il BLE finché non ci si ricollega
+      if(this.stallAt && num===this.stallAt && !this._stalled){
+        this._stalled=true; this.busDown=true; return;
+      }
       // accetto solo il pacchetto atteso (contiguo)
       if(num===this.count+1){ this.received.set(num, data); this.count=num; }
       // eventuale perdita di risposta (una volta)
@@ -404,10 +433,11 @@ class FakeCharger{
       let repCount=this.count;
       if(this.glitchCounterAt && num===this.glitchCounterAt && !this._glitched){
         this._glitched=true; repCount=Math.max(0,this.count-1);   // fingo di averne uno in meno
-        // "dimentico" l'ultimo per forzare il rinvio
         this.received.delete(this.count); this.count=repCount;
       }
-      this._emit(buildFrame(0x61,[0x01,(repCount>>8)&0xff, repCount&0xff]));
+      // il byte "stato" può essere 0 (come un duplicato): il client deve fidarsi del contatore
+      const statusByte = (this.dupStatusAt && num===this.dupStatusAt) ? 0x00 : 0x01;
+      this._emit(buildFrame(0x61,[statusByte,(repCount>>8)&0xff, repCount&0xff]));
     } else if(cmd===0x62){
       const p=frame.slice(3, frame.length-1);
       const got=(p[0])|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);
@@ -434,7 +464,7 @@ class FakeTransport{
   onData(cb){ this._cb=cb; }
   isConnected(){ return this.connected && !this.c.busDown; }
   async send(frame){ if(this.c.busDown){ throw new Error('bus down'); } await this.c.receive(toBytes(frame)); }
-  async reconnect(){ await this.c.reconnect(); this.connected=true; }
+  async reconnect(force){ await this.c.reconnect(force); this.connected=true; }
 }
 
 /* ===========================================================================
@@ -480,6 +510,8 @@ async function runSelfTest(logln){
     ['Risposte perse (pacch. 2,5,9)',   {loseResp:new Set([2,5,9])}],
     ['Contatore sfasato (ripartenza)',  {glitchCounterAt:4}],
     ['Caduta + perdite insieme',        {dropAfterPrepare:true, loseResp:new Set([1,3,7])}],
+    ['Blocco a metà + ripartenza auto', {stallAt:120}],
+    ['Risposta "duplicato" (stato 0)',  {dupStatusAt:3}],
     ['File piccolo (160 KB)',           {size:160*1024}],
     ['File grande (380 KB)',            {size:380*1024}],
   ];

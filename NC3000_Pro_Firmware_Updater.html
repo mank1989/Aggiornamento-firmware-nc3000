@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NC3000 Pro · Aggiornamento firmware</title>
+<style>
+  :root{ --bg:#0b0e14; --card:#141a24; --line:#232c3a; --tx:#e7edf5; --mut:#8aa0b8; --grn:#30d158; --red:#ff453a; --org:#ff9f0a; --blu:#0a84ff; }
+  @media (prefers-color-scheme:light){ :root:not([data-theme=dark]){ --bg:#f4f6f9; --card:#fff; --line:#dde3ea; --tx:#111; --mut:#5a6a7a; } }
+  *{ box-sizing:border-box }
+  body{ margin:0; background:var(--bg); color:var(--tx); font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; padding:16px; max-width:720px; margin:0 auto }
+  h1{ font-size:19px; margin:4px 0 2px } .sub{ color:var(--mut); font-size:13px; margin:0 0 14px }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:10px 0 }
+  .sec{ font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--mut); margin:0 0 8px }
+  button{ font:inherit; font-weight:600; color:#fff; background:#2a3443; border:1px solid var(--line); border-radius:10px; padding:11px 14px; cursor:pointer }
+  button.primary{ background:var(--blu); border-color:transparent }
+  button.go{ background:var(--grn); border-color:transparent; color:#04210f }
+  button.warn{ background:transparent; color:var(--org); border-color:var(--org) }
+  button:disabled{ opacity:.45; cursor:not-allowed }
+  .row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center }
+  .kv{ display:flex; justify-content:space-between; gap:12px; padding:3px 0; border-bottom:1px dashed var(--line) }
+  .kv:last-child{ border-bottom:0 } .kv b{ font-weight:600 } .mono{ font-family:ui-monospace,Menlo,Consolas,monospace }
+  .ok{ color:var(--grn) } .bad{ color:var(--red) } .warnc{ color:var(--org) }
+  input[type=file]{ color:var(--mut); font-size:13px; width:100% }
+  label.chk{ display:flex; gap:9px; align-items:flex-start; cursor:pointer; color:var(--tx) }
+  label.chk input{ margin-top:3px; transform:scale(1.2) }
+  .bar{ height:14px; background:#0006; border:1px solid var(--line); border-radius:8px; overflow:hidden }
+  .bar > i{ display:block; height:100%; width:0; background:var(--grn); transition:width .2s }
+  #log{ background:#05070b; color:#cfe3ff; border:1px solid var(--line); border-radius:10px; padding:10px; height:230px; overflow:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; white-space:pre-wrap; word-break:break-all }
+  .hint{ color:var(--mut); font-size:12.5px } .big{ font-size:17px }
+  .pill{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line) }
+  .danger{ border-color:var(--red); color:var(--red) }
+</style>
+</head>
+<body>
+<h1>NC3000 Pro · Aggiornamento firmware</h1>
+<p class="sub">Web Bluetooth · Chrome su Android/PC · nessun server, nessuna app. Il file resta sul tuo dispositivo. App non ufficiale, non affiliata a SkyRC.</p>
+
+<div class="card">
+  <div class="sec">1 · File firmware (.bin)</div>
+  <input type="file" id="file" accept=".bin,application/octet-stream">
+  <div id="fileInfo" class="hint" style="margin-top:8px">Scegli il file .bin del firmware dal telefono o dal PC.</div>
+</div>
+
+<div class="card">
+  <div class="sec">2 · Caricabatterie</div>
+  <div class="row"><button id="btnConnect" class="primary">Connetti</button>
+    <button id="btnDisc" disabled>Disconnetti</button>
+    <span id="connState" class="pill">non connesso</span></div>
+  <div id="devInfo" class="hint" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <div class="sec">3 · Avvio aggiornamento</div>
+  <p class="hint" id="safetyNote">⚠️ Togli tutte le batterie e assicurati che nessuno slot sia attivo: il caricatore rifiuta l'aggiornamento se uno slot è in funzione.</p>
+  <label class="chk" style="margin:8px 0"><input type="checkbox" id="confirm"><span>Confermo: ho tolto le batterie, nessuno slot è attivo, e voglio scrivere <b id="cfName">questo file</b> sul mio NC3000 Pro. So che posso ripristinare l'originale.</span></label>
+  <div class="row">
+    <button id="btnStart" class="go" disabled>Avvia aggiornamento</button>
+    <button id="btnResume" class="warn" disabled title="Se un aggiornamento si è interrotto dopo il «prepara», il caricatore è nel bootloader: riparte dall'handshake senza rimandare 0x60.">Riprendi (salta prepara)</button>
+  </div>
+  <div style="margin-top:12px" class="bar"><i id="barFill"></i></div>
+  <div id="barTxt" class="hint" style="margin-top:4px">&nbsp;</div>
+</div>
+
+<div class="card">
+  <div class="sec">Registro</div>
+  <div class="row" style="margin-bottom:8px">
+    <button id="btnCopy">Copia registro</button>
+    <button id="btnSim">Prova simulata (caricatore finto)</button>
+    <span class="hint">La prova simulata non tocca nessun dispositivo reale.</span>
+  </div>
+  <div id="log"></div>
+</div>
+
+<p class="hint">In caso di problemi dopo il «prepara», il caricatore resta nel bootloader: usa «Riprendi», oppure ripristina il firmware originale con l'app SkyRC. Copia sempre il registro completo se qualcosa va storto.</p>
+
+<script>
+"use strict";
+/* ============================================================================
+   NC3000 Pro — aggiornamento firmware via Web Bluetooth (BLE FFE0/FFE1)
+   Logica di protocollo indipendente dal DOM (testabile in Node).
+   ============================================================================ */
+
+const SVC = 0xffe0, CHR = 0xffe1;
+
+// ---- tempi (ms), scalabili per i test ----
+const TIMING = {
+  PREPARE_WAIT: 3000, PREPARE_MAX: 3,
+  AFTER_PREPARE: 2000, RESET_SETTLE: 1500,
+  HS_FIRST: 5000, HS_RETRY: 2000, HS_MAX: 8,
+  FIRST3: 1000, DATA_RESP: 2000, DATA_MAX_RESEND: 8,
+  BEFORE_FINISH: 3300, FINISH: 10000,
+  RECONNECT_TRY: 12, RECONNECT_GAP: 700
+};
+const DATA_LEN = 196, HS_ZEROS = 200, WRITE_CHUNK = 20;
+
+// ---- util ----
+function hex(a){ return Array.from(a, b => b.toString(16).padStart(2,'0')).join(' '); }
+function u32le(dv, o){ return dv.getUint32(o, true); }
+function toBytes(x){ return x instanceof Uint8Array ? x : new Uint8Array(x); }
+
+// somma a 32 bit di tutti i byte del file
+function computeSum(file){ let s=0; for(let i=0;i<file.length;i++) s=(s+file[i])>>>0; return s>>>0; }
+
+// pacchetto: 0F, len, cmd, dati..., somma ; len = cmd+dati+somma ; somma = (cmd+dati)&0xFF
+function buildFrame(cmd, data){
+  data = data || [];
+  const len = 1 + data.length + 1;
+  let sum = cmd & 0xff;
+  for(const b of data) sum = (sum + b) & 0xff;
+  const out = new Uint8Array(2 + len);
+  out[0]=0x0f; out[1]=len; out[2]=cmd & 0xff;
+  for(let i=0;i<data.length;i++) out[3+i]=data[i]&0xff;
+  out[out.length-1]=sum;
+  return out;
+}
+function frameChecksumOk(f){
+  const n=f.length; if(n<4) return false;
+  let s=0; for(let i=2;i<n-1;i++) s=(s+f[i])&0xff; return s===f[n-1];
+}
+
+// validazione file firmware Pro
+function validateFirmware(buf){
+  const n=buf.length, errs=[], warn=[];
+  const dv=new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if(n < 150*1024 || n > 400*1024) errs.push('Dimensione fuori range (150–400 KB): '+n+' byte');
+  let sp=null, reset=null;
+  if(n>=8){
+    sp=u32le(dv,0); reset=u32le(dv,4);
+    if(!(sp>=0x20000000 && sp<0x20040000)) errs.push('Stack pointer non valido: 0x'+sp.toString(16));
+    if(!((reset&1)===1 && reset>=0x0800c000 && reset < 0x0800c000+n)) errs.push('Reset vector non valido: 0x'+(reset>>>0).toString(16));
+  } else errs.push('File troppo piccolo');
+  const sum=computeSum(buf);
+  if(n===305228 && sum===27758290) warn.push('Corrisponde al firmware ufficiale 2.56 (305.228 byte).');
+  return { ok:errs.length===0, errs, warn, size:n, sum, sp, reset };
+}
+
+/* ---------------------------------------------------------------------------
+   Flasher: esegue il protocollo su un "transport" astratto.
+   transport = { send(frameBytes)->Promise, onData(cb), isConnected()->bool,
+                 reconnect()->Promise }   (cb riceve pezzi grezzi da ricomporre)
+   --------------------------------------------------------------------------- */
+class Flasher{
+  constructor(transport, opts){
+    opts = opts || {};
+    this.t = transport;
+    this.log = opts.log || (()=>{});
+    this.onProgress = opts.onProgress || (()=>{});
+    this.scale = opts.timeScale || 1;
+    this._rx = [];
+    this._frames = [];
+    this._waiters = [];
+    this.id = null;                 // {model, major, minor, hw}
+    this.aborted = false;
+    this.t.onData((bytes)=>this._onChunk(bytes));
+  }
+  T(ms){ return Math.max(1, Math.round(ms*this.scale)); }
+  sleep(ms){ return new Promise(r=>setTimeout(r, this.T(ms))); }
+
+  _onChunk(bytes){
+    for(const b of bytes) this._rx.push(b & 0xff);
+    while(this._rx.length>=2){
+      if(this._rx[0]!==0x0f){ this._rx.shift(); continue; }   // risincronizzo
+      const len=this._rx[1], total=len+2;
+      if(len<2 || len>230){ this._rx.shift(); continue; }      // lunghezza assurda
+      if(this._rx.length<total) break;
+      const f=new Uint8Array(this._rx.slice(0,total));
+      this._rx.splice(0,total);
+      if(!frameChecksumOk(f)){ this.log('RX somma errata: '+hex(f)); continue; }
+      this._dispatch(f);
+    }
+  }
+  _dispatch(f){
+    for(let i=0;i<this._waiters.length;i++){
+      if(this._waiters[i].pred(f)){
+        const w=this._waiters.splice(i,1)[0]; clearTimeout(w.timer); w.resolve(f); return;
+      }
+    }
+    this._frames.push(f); if(this._frames.length>24) this._frames.shift();
+    this.log('RX '+hex(f));
+  }
+  // invia un frame e aspetta la risposta che soddisfa pred.
+  // Ritorna il frame, oppure null su timeout o se l'invio fallisce (es. bus caduto):
+  // nessun promise orfano, nessuna eccezione non gestita.
+  async sendWait(frame, pred, timeoutMs){
+    let waiter;
+    const p=new Promise((resolve)=>{
+      // controlla eventuali frame già arrivati
+      for(let i=0;i<this._frames.length;i++){
+        if(pred(this._frames[i])){ resolve(this._frames.splice(i,1)[0]); return; }
+      }
+      waiter={pred, resolve, timer:null};
+      waiter.timer=setTimeout(()=>{
+        const k=this._waiters.indexOf(waiter); if(k>=0) this._waiters.splice(k,1);
+        resolve(null);
+      }, this.T(timeoutMs));
+      this._waiters.push(waiter);
+    });
+    try{ await this.send(frame); }
+    catch(e){
+      if(waiter){ clearTimeout(waiter.timer); const k=this._waiters.indexOf(waiter); if(k>=0) this._waiters.splice(k,1); }
+      this.log('Invio fallito: '+e.message);
+      return null;
+    }
+    return p;
+  }
+  async send(frame){ this.log('TX '+hex(frame)); await this.t.send(frame); }
+  _abortCheck(){ if(this.aborted) throw new Error('ABORT'); }
+
+  // --- identità (solo in modalità applicazione) ---
+  async identify(){
+    const f=await this.sendWait(buildFrame(0x57,[0x00]), x=>x[2]===0x57, 3000);
+    if(!f) throw new Error('Nessuna risposta all\'identità');
+    const len=f[1];
+    const pidStart = len===0x13 ? 4 : (len===0x14 ? 5 : 4);
+    if(f.length < pidStart+16) throw new Error('Risposta identità corta');
+    const pid=f.slice(pidStart, pidStart+16);
+    let model=''; for(let i=0;i<6;i++) model += String.fromCharCode(pid[i]);
+    const idd={ model, major:pid[11], minor:pid[12], hw:pid[13], pid };
+    this.id=idd;
+    this.log('Identità: modello '+model+' · versione '+pid[11]+'.'+pid[12]+' · hw '+pid[13]);
+    return idd;
+  }
+  // --- interrogazione bootloader 0x66 -> lunghezza dati pacchetto ---
+  async queryBootloader(){
+    const f=await this.sendWait(buildFrame(0x66,[0x00]), x=>x[2]===0x66, 3000);
+    if(!f) throw new Error('Nessuna risposta al bootloader');   // 0F 05 66 00 a b sum
+    const a=f[4], b=f[5];
+    const dlen=(a!==0 || b!==0) ? 196 : 16;
+    this.log('Bootloader 0x66: a='+a+' b='+b+' → pacchetti dati da '+dlen+' byte');
+    return dlen;
+  }
+  // --- prepara 0x60 (dopo conferma utente) ---
+  async prepare(major,minor,hw){
+    for(let att=1; att<=TIMING.PREPARE_MAX; att++){
+      this._abortCheck();
+      this.log('Prepara (tentativo '+att+'/'+TIMING.PREPARE_MAX+'): '+major+'.'+minor+' hw '+hw);
+      const r=await this.sendWait(buildFrame(0x60,[major,minor,hw]), f=>f[2]===0x60, TIMING.PREPARE_WAIT);
+      if(!r){ this.log('Nessuna risposta al prepara, riprovo…'); continue; }
+      if(r[3]===0x01){ this.log('Prepara accettato. Il caricatore si riavvia nel bootloader…'); return true; }
+      if(r[3]===0x00){ throw new Error('REJECTED'); }
+      this.log('Risposta prepara inattesa: '+hex(r));
+    }
+    throw new Error('PREPARE_FAIL');
+  }
+  async afterPrepare(){
+    await this.sleep(TIMING.RESET_SETTLE);
+    if(!this.t.isConnected()){
+      this.log('Bluetooth caduto dopo il reset: mi ricollego…');
+      await this._reconnect();
+    }
+    await this.sleep(TIMING.AFTER_PREPARE);
+  }
+  async _reconnect(){
+    for(let i=1;i<=TIMING.RECONNECT_TRY;i++){
+      this._abortCheck();
+      try{ await this.t.reconnect(); if(this.t.isConnected()){ this.log('Ricollegato (tentativo '+i+')'); this._rx=[]; return; } }
+      catch(e){ /* riprova */ }
+      await this.sleep(TIMING.RECONNECT_GAP);
+    }
+    throw new Error('RECONNECT_FAIL');
+  }
+  // --- handshake 0x61 (200 zeri) ---
+  async handshake(){
+    const zeros=new Array(HS_ZEROS).fill(0);
+    for(let att=1; att<=TIMING.HS_MAX; att++){
+      this._abortCheck();
+      const to = att===1 ? TIMING.HS_FIRST : TIMING.HS_RETRY;
+      const r=await this.sendWait(buildFrame(0x61, zeros), f=>f[2]===0x61, to);
+      if(!r){ this.log('Handshake: nessuna risposta ('+att+')'); continue; }
+      const stato=r[3], cnt=(r[4]<<8)|r[5];
+      if(stato===0 && cnt===0){ this.log('Bootloader pronto a ricevere.'); return; }
+      this.log('Handshake: stato '+stato+' contatore '+cnt+', riprovo…');
+      await this.sleep(300);
+    }
+    throw new Error('HANDSHAKE_FAIL');
+  }
+  // --- invio dati 0x61 ---
+  async sendData(file){
+    const total=Math.ceil(file.length/DATA_LEN);
+    this.log('Invio '+total+' pacchetti da '+DATA_LEN+' byte.');
+    let num=1;
+    while(num<=total){
+      this._abortCheck();
+      if(num<=3) await this.sleep(TIMING.FIRST3);
+      const start=(num-1)*DATA_LEN;
+      const payload=new Array(4+DATA_LEN).fill(0);
+      payload[0]=(num>>8)&0xff; payload[1]=num&0xff;    // numero pacchetto BE
+      for(let i=0;i<DATA_LEN && start+i<file.length;i++) payload[4+i]=file[start+i];
+      let done=false;
+      for(let resend=0; resend<TIMING.DATA_MAX_RESEND && !done; resend++){
+        const r=await this.sendWait(buildFrame(0x61, payload), f=>f[2]===0x61, TIMING.DATA_RESP);
+        if(!r){ this.log('Pacchetto '+num+': nessuna risposta, rimando ('+(resend+1)+')'); continue; }
+        const stato=r[3], cnt=(r[4]<<8)|r[5];
+        if(stato===1){
+          if(cnt!==num){ this.log('Contatore '+cnt+' ≠ inviato '+num+': riparto da '+(cnt+1)); num=cnt+1; }
+          else num=num+1;
+          done=true;
+        } else { this.log('Pacchetto '+num+': stato '+stato+', rimando'); }
+      }
+      if(!done) throw new Error('DATA_FAIL@'+num);
+      this.onProgress(Math.min(num-1,total), total);
+    }
+  }
+  // --- fine 0x62 (somma del file, 32 bit LE) ---
+  async finish(fileSum){
+    await this.sleep(TIMING.BEFORE_FINISH);
+    const s=fileSum>>>0;
+    const payload=[s&0xff,(s>>8)&0xff,(s>>16)&0xff,(s>>24)&0xff];
+    const r=await this.sendWait(buildFrame(0x62, payload), f=>f[2]===0x62, TIMING.FINISH);
+    if(!r) throw new Error('FINISH_FAIL:timeout');
+    if(r[3]===0x01){ this.log('✓ Aggiornamento completato con successo.'); return true; }
+    throw new Error('FINISH_FAIL:'+r[3]);
+  }
+  // --- orchestrazione ---
+  async run(file, o){
+    o=o||{};
+    if(!o.skipPrepare){
+      await this.prepare(o.major, o.minor, o.hw);
+      await this.afterPrepare();
+    } else {
+      this.log('Ripresa: salto il prepara (caricatore già nel bootloader).');
+      if(!this.t.isConnected()) await this._reconnect();
+    }
+    await this.handshake();
+    await this.sendData(file);
+    await this.finish(computeSum(file));
+    return true;
+  }
+}
+
+/* ===========================================================================
+   SIMULATORE (caricatore finto) per i test e per il pulsante "Prova simulata".
+   Implementa lo stesso bus: riceve frame interi, risponde a pezzi da 20 byte.
+   Opzioni: dropAfterPrepare, loseResp (Set di numeri pacchetto di cui perdere
+   la risposta una volta), glitchCounterAt (restituisce contatore sbagliato una
+   volta per testare la ripartenza).
+   =========================================================================== */
+class FakeCharger{
+  constructor(file, opts){
+    opts=opts||{};
+    this.file=file;
+    this.model=opts.model||'100209';
+    this.ver=opts.ver||[0x02,0x38,0x01];      // 2.56 hw1
+    this.dlen=opts.dlen||196;
+    this.dropAfterPrepare=!!opts.dropAfterPrepare;
+    this.loseResp=opts.loseResp||new Set();
+    this.glitchCounterAt=opts.glitchCounterAt||0;
+    this.slotActive=!!opts.slotActive;
+    this.phase='app';                         // app -> boot
+    this.received=new Map();                   // num -> 196 byte
+    this.count=0;                              // pacchetti contigui ricevuti
+    this.busDown=false;
+    this.cb=null;
+    this._glitched=false;
+    this.finishedSum=null;
+  }
+  // interfaccia transport (lato Flasher)
+  attach(cb){ this.cb=cb; }
+  _emit(frame){
+    if(this.busDown) return;
+    // consegna a pezzi da 20 byte
+    for(let i=0;i<frame.length;i+=20){
+      const piece=frame.slice(i,i+20);
+      Promise.resolve().then(()=>{ if(!this.busDown && this.cb) this.cb(piece); });
+    }
+  }
+  async reconnect(){ this.busDown=false; }
+  // riceve un frame intero dal Flasher
+  async receive(frame){
+    if(this.busDown) return;
+    if(!frameChecksumOk(frame)) return;
+    const cmd=frame[2];
+    if(cmd===0x57){
+      const pid=new Uint8Array(16);
+      for(let i=0;i<6;i++) pid[i]=this.model.charCodeAt(i);
+      pid[11]=this.ver[0]; pid[12]=this.ver[1]; pid[13]=this.ver[2];
+      // risposta lunghezza 0x13: 0F 13 57 00 <16 pid> sum
+      this._emit(buildFrame(0x57, [0x00, ...pid]));
+    } else if(cmd===0x66){
+      const a = this.dlen===196 ? 1 : 0;
+      this._emit(buildFrame(0x66, [0x00, a, 0x00]));
+    } else if(cmd===0x60){
+      if(this.slotActive){ this._emit(buildFrame(0x60,[0x00])); return; }
+      this._emit(buildFrame(0x60,[0x01]));
+      this.phase='boot';
+      // la caduta BLE avviene DOPO che l'ack è stato consegnato (reset del caricatore)
+      if(this.dropAfterPrepare){ setTimeout(()=>{ this.busDown=true; }, 0); }
+    } else if(cmd===0x61){
+      if(this.phase!=='boot') return;
+      const payload=frame.slice(3, frame.length-1);
+      const isHandshake = payload.length>=200 && payload.every(b=>b===0);
+      if(isHandshake){
+        this._emit(buildFrame(0x61,[0x00,0x00,0x00]));   // stato 0 contatore 0
+        return;
+      }
+      const num=(payload[0]<<8)|payload[1];
+      const data=payload.slice(4, 4+DATA_LEN);
+      // accetto solo il pacchetto atteso (contiguo)
+      if(num===this.count+1){ this.received.set(num, data); this.count=num; }
+      // eventuale perdita di risposta (una volta)
+      if(this.loseResp.has(num)){ this.loseResp.delete(num); return; }
+      // eventuale contatore sbagliato (una volta) per testare la ripartenza
+      let repCount=this.count;
+      if(this.glitchCounterAt && num===this.glitchCounterAt && !this._glitched){
+        this._glitched=true; repCount=Math.max(0,this.count-1);   // fingo di averne uno in meno
+        // "dimentico" l'ultimo per forzare il rinvio
+        this.received.delete(this.count); this.count=repCount;
+      }
+      this._emit(buildFrame(0x61,[0x01,(repCount>>8)&0xff, repCount&0xff]));
+    } else if(cmd===0x62){
+      const p=frame.slice(3, frame.length-1);
+      const got=(p[0])|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);
+      // ricostruisco l'immagine e confronto col file
+      const img=this.rebuild();
+      const sum=computeSum(this.file)>>>0;
+      this.finishedSum=got>>>0;
+      const same = img.length>=this.file.length && eqBytes(img.slice(0,this.file.length), this.file) && (got>>>0)===sum;
+      this._emit(buildFrame(0x62,[ same?0x01:0x00 ]));
+    }
+  }
+  rebuild(){
+    const parts=[]; for(let i=1;i<=this.count;i++){ const d=this.received.get(i); if(!d) break; parts.push(d); }
+    const out=new Uint8Array(parts.length*DATA_LEN);
+    parts.forEach((d,i)=>out.set(d, i*DATA_LEN));
+    return out;
+  }
+}
+function eqBytes(a,b){ if(a.length!==b.length) return false; for(let i=0;i<a.length;i++) if(a[i]!==b[i]) return false; return true; }
+
+// transport che collega Flasher <-> FakeCharger
+class FakeTransport{
+  constructor(charger){ this.c=charger; this.connected=true; charger.attach((bytes)=>{ if(this._cb) this._cb(bytes); }); }
+  onData(cb){ this._cb=cb; }
+  isConnected(){ return this.connected && !this.c.busDown; }
+  async send(frame){ if(this.c.busDown){ throw new Error('bus down'); } await this.c.receive(toBytes(frame)); }
+  async reconnect(){ await this.c.reconnect(); this.connected=true; }
+}
+
+/* ===========================================================================
+   SELF-TEST: esegue scenari contro il simulatore e verifica l'immagine.
+   =========================================================================== */
+function makeFakeFirmware(size){
+  // file "valido": SP in RAM, reset vector dispari dentro il range
+  const n=size||220*1024;
+  const b=new Uint8Array(n);
+  const dv=new DataView(b.buffer);
+  dv.setUint32(0, 0x2000f000, true);       // SP
+  dv.setUint32(4, 0x0800c1dd, true);       // reset (dispari)
+  let x=0x12345678;
+  for(let i=8;i<n;i++){ x=(x*1103515245+12345)&0x7fffffff; b[i]=x&0xff; }
+  return b;
+}
+async function runScenario(name, opts, logln){
+  const file=opts.file || makeFakeFirmware(opts.size);
+  const fake=new FakeCharger(file, opts);
+  const tr=new FakeTransport(fake);
+  const logs=[];
+  const fl=new Flasher(tr, { timeScale: 0.004, log:(m)=>logs.push(m), onProgress:()=>{} });
+  const id=await fl.identify();
+  if(id.model!=='100209') throw new Error('modello non riconosciuto');
+  const dlen=await fl.queryBootloader();
+  if(dlen!==196) throw new Error('bootloader a 16 byte');
+  await fl.run(file, { major:id.major, minor:id.minor, hw:id.hw, skipPrepare:opts.skipPrepare });
+  // verifica finale: l'immagine ricostruita dal simulatore == file, e la somma inviata è giusta
+  const img=fake.rebuild();
+  const okImg = img.length>=file.length && eqBytes(img.slice(0,file.length), file);
+  const okSum = fake.finishedSum===(computeSum(file)>>>0);
+  if(!okImg) throw new Error('immagine ricevuta diversa dal file');
+  if(!okSum) throw new Error('somma finale errata');
+  logln('✓ '+name+' — immagine identica ('+file.length+' byte), somma ok');
+  return true;
+}
+async function runSelfTest(logln){
+  logln('— Prova simulata: inizio —');
+  let pass=0, fail=0;
+  const scenarios=[
+    ['Normale',                         {}],
+    ['Caduta e ricollegamento BLE',     {dropAfterPrepare:true}],
+    ['Risposte perse (pacch. 2,5,9)',   {loseResp:new Set([2,5,9])}],
+    ['Contatore sfasato (ripartenza)',  {glitchCounterAt:4}],
+    ['Caduta + perdite insieme',        {dropAfterPrepare:true, loseResp:new Set([1,3,7])}],
+    ['File piccolo (160 KB)',           {size:160*1024}],
+    ['File grande (380 KB)',            {size:380*1024}],
+  ];
+  for(const [nm,opt] of scenarios){
+    try{ await runScenario(nm, opt, logln); pass++; }
+    catch(e){ logln('✗ '+nm+' — '+e.message); fail++; }
+  }
+  // scenario "slot attivo": il prepara deve essere rifiutato
+  try{
+    const file=makeFakeFirmware(200*1024);
+    const fake=new FakeCharger(file,{slotActive:true});
+    const fl=new Flasher(new FakeTransport(fake),{timeScale:0.004, log:()=>{}});
+    await fl.identify(); await fl.queryBootloader();
+    let rejected=false;
+    try{ await fl.run(file,{major:2,minor:0x38,hw:1}); }catch(e){ rejected = (e.message==='REJECTED'); }
+    if(rejected){ logln('✓ Slot attivo — prepara correttamente rifiutato'); pass++; }
+    else { logln('✗ Slot attivo — avrebbe dovuto rifiutare'); fail++; }
+  }catch(e){ logln('✗ Slot attivo — '+e.message); fail++; }
+  logln('— Prova simulata: '+pass+' superati, '+fail+' falliti —');
+  return {pass, fail};
+}
+
+// esportazione per Node (test)
+if(typeof module!=='undefined' && module.exports){
+  module.exports={ buildFrame, frameChecksumOk, validateFirmware, computeSum, Flasher, FakeCharger, FakeTransport, runSelfTest, runScenario, makeFakeFirmware, eqBytes };
+}
+
+/* ===========================================================================
+   INTERFACCIA (solo nel browser)
+   =========================================================================== */
+if(typeof document!=='undefined'){
+(function(){
+  const $=id=>document.getElementById(id);
+  const logEl=$('log');
+  function log(m){ const t=new Date().toLocaleTimeString('it-IT'); logEl.textContent += '['+t+'] '+m+'\n'; logEl.scrollTop=logEl.scrollHeight; }
+  function setBar(done,total){ const pc= total? Math.round(done/total*100):0; $('barFill').style.width=pc+'%'; $('barTxt').textContent = total? (done+'/'+total+' pacchetti ('+pc+'%)') : ' '; }
+
+  let fileBytes=null, fileCheck=null, dev=null, gattChar=null, flasher=null, wakeLock=null, preparedOnce=false;
+
+  // ---------- file ----------
+  $('file').addEventListener('change', async (e)=>{
+    const f=e.target.files[0]; if(!f) return;
+    fileBytes=new Uint8Array(await f.arrayBuffer());
+    fileCheck=validateFirmware(fileBytes);
+    $('cfName').textContent=f.name;
+    let h='<div class="kv"><span>Nome</span><b>'+escapeHtml(f.name)+'</b></div>'+
+          '<div class="kv"><span>Dimensione</span><b>'+fileBytes.length.toLocaleString('it-IT')+' byte</b></div>'+
+          '<div class="kv"><span>Somma (32 bit)</span><b class="mono">'+fileCheck.sum.toLocaleString('it-IT')+'</b></div>';
+    if(fileCheck.sp!=null) h+='<div class="kv"><span>Stack / Reset</span><b class="mono">0x'+fileCheck.sp.toString(16)+' / 0x'+(fileCheck.reset>>>0).toString(16)+'</b></div>';
+    h+= fileCheck.ok ? '<div class="kv"><span>Controllo</span><b class="ok">valido ✓</b></div>'
+                     : '<div class="kv"><span>Controllo</span><b class="bad">NON valido</b></div>';
+    for(const w of fileCheck.warn) h+='<div class="hint">• '+escapeHtml(w)+'</div>';
+    for(const er of fileCheck.errs) h+='<div class="hint bad">• '+escapeHtml(er)+'</div>';
+    $('fileInfo').innerHTML=h;
+    if(!fileCheck.ok) log('File rifiutato dai controlli: '+fileCheck.errs.join(' | '));
+    else log('File caricato e valido: '+fileBytes.length+' byte, somma '+fileCheck.sum);
+    refresh();
+  });
+
+  // ---------- BLE reale ----------
+  // Unico percorso dati: il Flasher registra cb via onData(); la caratteristica
+  // chiama SEMPRE cb, e al ricollegamento la riaggancia alla nuova caratteristica.
+  function makeRealTransport(){
+    let cb=null;
+    function attachNotify(){
+      gattChar.addEventListener('characteristicvaluechanged', ev=>{ if(cb) cb(new Uint8Array(ev.target.value.buffer)); });
+    }
+    return {
+      onData(fn){ cb=fn; },
+      _attach: attachNotify,
+      isConnected(){ return !!(dev && dev.gatt && dev.gatt.connected && gattChar); },
+      async send(frame){
+        // scrittura a pezzi da 20 byte, senza risposta
+        for(let i=0;i<frame.length;i+=WRITE_CHUNK){
+          const piece=frame.slice(i, i+WRITE_CHUNK);
+          if(gattChar.writeValueWithoutResponse) await gattChar.writeValueWithoutResponse(piece);
+          else await gattChar.writeValue(piece);
+        }
+      },
+      async reconnect(){
+        await dev.gatt.connect();                 // stesso dispositivo, nessun picker
+        const svc=await dev.gatt.getPrimaryService(SVC);
+        gattChar=await svc.getCharacteristic(CHR);
+        attachNotify();
+        await gattChar.startNotifications();
+      }
+    };
+  }
+  let realTransport=null;
+
+  $('btnConnect').addEventListener('click', async ()=>{
+    if(!navigator.bluetooth){ log('Web Bluetooth non disponibile. Usa Chrome su Android o PC in HTTPS.'); return; }
+    try{
+      log('Scelta del dispositivo…');
+      dev=await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[SVC] });
+      dev.addEventListener('gattserverdisconnected', ()=>{ $('connState').textContent='disconnesso'; $('connState').className='pill danger'; $('btnDisc').disabled=true; });
+      log('Dispositivo: '+(dev.name||'senza nome'));
+      await dev.gatt.connect();
+      const svc=await dev.gatt.getPrimaryService(SVC);
+      gattChar=await svc.getCharacteristic(CHR);
+      realTransport=makeRealTransport();
+      flasher=new Flasher(realTransport, { log, onProgress:setBar });  // registra cb via onData()
+      realTransport._attach();                                          // aggancia la caratteristica a cb
+      await gattChar.startNotifications();
+      $('connState').textContent='connesso'; $('connState').className='pill'; $('btnDisc').disabled=false;
+      log('Connesso. Leggo identità…');
+      const id=await flasher.identify();
+      if(id.model!=='100209'){
+        log('⚠️ Modello '+id.model+' ≠ 100209: questa pagina è solo per NC3000 Pro. Mi fermo.');
+        $('devInfo').innerHTML='<b class="bad">Modello non compatibile: '+escapeHtml(id.model)+'</b>';
+        return;
+      }
+      const dlen=await flasher.queryBootloader();
+      let info='<div class="kv"><span>Modello</span><b>'+id.model+' (NC3000 Pro)</b></div>'+
+               '<div class="kv"><span>Versione installata</span><b>'+id.major+'.'+id.minor+' · hw '+id.hw+'</b></div>'+
+               '<div class="kv"><span>Pacchetti dati</span><b>'+dlen+' byte</b></div>';
+      $('devInfo').innerHTML=info;
+      if(dlen!==196){ log('⚠️ Bootloader a 16 byte: fermati e avvisami, non proseguo.'); }
+      refresh();
+    }catch(e){ log('Errore connessione: '+e.message); }
+  });
+
+  $('btnDisc').addEventListener('click', ()=>{ try{ if(dev&&dev.gatt.connected) dev.gatt.disconnect(); }catch(e){} });
+
+  // ---------- avvio / ripresa ----------
+  function refresh(){
+    const ready = fileBytes && fileCheck && fileCheck.ok && flasher && flasher.id && flasher.id.model==='100209';
+    $('btnStart').disabled = !(ready && $('confirm').checked);
+    $('btnResume').disabled = !(ready && preparedOnce);
+  }
+  $('confirm').addEventListener('change', refresh);
+
+  async function keepAwake(on){
+    try{
+      if(on && 'wakeLock' in navigator){ wakeLock=await navigator.wakeLock.request('screen'); }
+      else if(!on && wakeLock){ await wakeLock.release(); wakeLock=null; }
+    }catch(e){}
+  }
+
+  async function doFlash(skipPrepare){
+    if(!fileCheck.ok){ log('File non valido, non procedo.'); return; }
+    $('btnStart').disabled=true; $('btnResume').disabled=true; $('btnConnect').disabled=true;
+    await keepAwake(true);
+    try{
+      const id=flasher.id;
+      if(!skipPrepare){ preparedOnce=true; }
+      await flasher.run(fileBytes, { major:id.major, minor:id.minor, hw:id.hw, skipPrepare });
+      log('🎉 Fatto. Scollega e riaccendi il caricatore per usarlo.');
+      setBar(1,1);
+    }catch(e){
+      if(e.message==='REJECTED'){ log('✋ Prepara RIFIUTATO: uno slot è attivo. Togli le batterie e riprova.'); }
+      else if(e.message==='PREPARE_FAIL'){ log('✋ Il caricatore non ha risposto al prepara. Riprova.'); }
+      else if(e.message==='RECONNECT_FAIL'){ log('✋ Non sono riuscito a ricollegarmi dopo il reset. Il caricatore è nel bootloader: riavvicina il Bluetooth e premi «Riprendi».'); }
+      else if(e.message==='HANDSHAKE_FAIL'){ log('✋ Il bootloader non ha risposto all\'handshake. Premi «Riprendi» per ritentare.'); }
+      else if(e.message.startsWith('DATA_FAIL')){ log('✋ Invio dati interrotto ('+e.message+'). Premi «Riprendi».'); }
+      else if(e.message.startsWith('FINISH_FAIL')){ log('✋ Il caricatore non ha confermato la fine. Potrebbe servire ripetere: premi «Riprendi».'); }
+      else log('✋ Errore: '+e.message);
+      log('Se resta bloccato: ripristina il firmware originale con l\'app SkyRC. Copia tutto il registro.');
+    }finally{
+      await keepAwake(false);
+      $('btnConnect').disabled=false;
+      refresh();
+    }
+  }
+  $('btnStart').addEventListener('click', ()=>{
+    if(!confirm('Sto per SCRIVERE il firmware sul caricatore. Batterie tolte e nessuno slot attivo?')) return;
+    doFlash(false);
+  });
+  $('btnResume').addEventListener('click', ()=> doFlash(true));
+
+  // ---------- utilità ----------
+  $('btnCopy').addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(logEl.textContent); log('(registro copiato)'); }catch(e){ log('Copia non riuscita: seleziona il testo a mano.'); } });
+  $('btnSim').addEventListener('click', async ()=>{ $('btnSim').disabled=true; await runSelfTest(log); $('btnSim').disabled=false; });
+
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  log('Pronto. 1) scegli il file  2) connetti  3) conferma e avvia.');
+  log('Suggerimento: fai prima la «Prova simulata» per vedere la sequenza senza rischi.');
+})();
+}
+</script>
+</body>
+</html>
